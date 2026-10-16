@@ -1,0 +1,129 @@
+name: Build and publish release
+
+# Manual only. Checks out the private source repo with a read-only deploy key,
+# builds the signed installers on GitHub-hosted runners (free for public
+# repos) and publishes them, with latest.json, as a release of this repo.
+# The source code only lives in the ephemeral runner: it is never uploaded,
+# cached or printed.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit of the source repo to build"
+        required: true
+        default: main
+      notes:
+        description: "Release notes (Markdown, shown in the update dialog)"
+        required: false
+        default: ""
+
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    name: bundle (${{ matrix.name }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - name: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Disable CRLF conversion
+        run: git config --global core.autocrlf false
+
+      - name: Check out the private source (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: luisarz/cl-db
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CLDB_DEPLOY_KEY }}
+          persist-credentials: false
+          path: src
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: src/package.json
+
+      # No dependency caches on purpose: nothing from this build is kept.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        working-directory: src
+        run: pnpm install --frozen-lockfile
+
+      - name: Build signed installers
+        working-directory: src
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lacam-db-studio-${{ matrix.name }}
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            src/target/${{ matrix.target }}/release/bundle/msi/*.msi
+            src/target/${{ matrix.target }}/release/bundle/msi/*.msi.sig
+            src/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe
+            src/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe.sig
+            src/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            src/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+            src/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
+
+  publish:
+    needs: bundle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the private source (scripts only)
+        uses: actions/checkout@v4
+        with:
+          repository: luisarz/cl-db
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CLDB_DEPLOY_KEY }}
+          persist-credentials: false
+          path: src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish release and latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          VERSION=$(node -p "require('./src/src-tauri/tauri.conf.json').version")
+          printf '%s\n' "$NOTES" > notes.md
+          bash src/scripts/release/publish-update.sh "$VERSION" \
+            --artifacts-dir artifacts \
+            --notes-file notes.md \
+            --feed-repo "${{ github.repository }}"
